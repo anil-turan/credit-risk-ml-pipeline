@@ -3,8 +3,9 @@
 End-to-end machine learning pipeline for credit default prediction, built on the Home Credit Default Risk dataset.
 
 **Dataset:** Home Credit Default Risk (Kaggle) — 307,511 loan applications, 120+ features across 8 relational tables  
-**Baseline:** Logistic Regression · ROC-AUC 0.7458 · CV-AUC 0.7438 ± 0.0023  
-**Stack:** Python 3.11 · scikit-learn · XGBoost · LightGBM · SHAP · WoE/IV
+**Best model:** LightGBM + Optuna · ROC-AUC **0.754** · PR-AUC **0.243** · KS **37.9**  
+**Business evaluation:** Profit lift **£11.1M** vs default threshold · 19.2× risk separation across deciles  
+**Stack:** Python 3.11 · scikit-learn · XGBoost · LightGBM · Optuna · SHAP · FastAPI
 
 ---
 
@@ -15,28 +16,30 @@ credit-risk-ml-pipeline/
 ├── src/credit_risk/
 │   ├── features/
 │   │   ├── engineer.py       # domain feature engineering (DTI, ratios, age bins)
-│   │   ├── selector.py       # IV-based feature selection
+│   │   ├── selector.py       # variance + correlation + mutual information selection
 │   │   └── woe_encoder.py    # Weight of Evidence encoding for categoricals
 │   ├── models/
 │   │   ├── trainer.py        # multi-model training + StratifiedKFold CV
 │   │   └── evaluator.py      # ROC-AUC, PR-AUC, KS statistic
-│   └── explainability/       # SHAP helpers
+│   ├── explainability/       # SHAP helpers
+│   └── serving/
+│       └── app.py            # FastAPI prediction endpoint with risk grading
 ├── notebooks/
-│   ├── 01_eda.ipynb                  # target distribution, missing data, distributions
+│   ├── 01_eda.ipynb                  # target distribution, missing data, feature distributions
 │   ├── 02_feature_engineering.ipynb  # domain features, WoE encoding, IV scores
-│   ├── 03_modeling.ipynb             # LR baseline, XGBoost, LightGBM, CV comparison
-│   ├── 04_explainability.ipynb       # SHAP global + local explanations
-│   └── 05_business_evaluation.ipynb  # KS statistic, score bands, approval rate analysis
+│   ├── 03_modeling.ipynb             # LR baseline → XGBoost → LightGBM → Optuna tuning
+│   ├── 04_explainability.ipynb       # SHAP global + local + dependence plots
+│   └── 05_business_evaluation.ipynb  # KS statistic, decile analysis, profit curve
 ├── configs/
 │   └── model_config.yaml
 ├── data/
 │   ├── raw/                  # original CSVs (not committed)
 │   └── processed/            # engineered features (not committed)
 ├── outputs/
-│   ├── figures/              # EDA and evaluation plots
-│   └── reports/
-│       ├── model_results.csv
-│       └── iv_summary.csv
+│   ├── figures/              # all evaluation and SHAP plots
+│   ├── reports/
+│   │   └── model_results.csv
+│   └── best_model_bundle.pkl # saved model + preprocessor
 └── tests/
 ```
 
@@ -60,9 +63,22 @@ credit-risk-ml-pipeline/
 
 ---
 
+## Model Results
+
+| Model | ROC-AUC | PR-AUC | CV-AUC Mean | CV-AUC Std |
+|-------|---------|--------|-------------|------------|
+| Logistic Regression (baseline) | 0.7458 | 0.2278 | 0.7438 | 0.0023 |
+| XGBoost | 0.7558 | 0.2444 | 0.7467 | 0.0014 |
+| LightGBM (default) | 0.7535 | 0.2419 | 0.7467 | 0.0018 |
+| **LightGBM + Optuna** | **0.7540** | **0.2426** | **0.7494** | **0.0017** |
+
+> ROC-AUC is the primary metric in credit risk (alongside KS statistic). PR-AUC is low by design — an 8% default rate makes it harder to achieve high precision at all recall levels.
+
+---
+
 ## Domain Features Engineered
 
-All features are derived from financial risk concepts — no statistics learned from data, making them leak-free.
+All features are derived from financial risk concepts — no statistics learned from data, making them leak-free by design.
 
 | Feature | Formula | Risk Signal |
 |---------|---------|-------------|
@@ -71,7 +87,7 @@ All features are derived from financial risk concepts — no statistics learned 
 | `CREDIT_GOODS_RATIO` | loan amount / goods price | > 1 → possible overpricing |
 | `ANNUITY_CREDIT_RATIO` | annuity / credit | higher → shorter repayment, higher burden |
 | `AGE_YEARS` | −DAYS_BIRTH / 365.25 | younger applicants → higher default risk |
-| `EMPLOYMENT_YEARS` | −DAYS_EMPLOYED / 365.25 | clipped at 50, removes anomalous value |
+| `EMPLOYMENT_YEARS` | −DAYS_EMPLOYED / 365.25 | clipped at 50 to remove anomalous values |
 | `EMPLOYMENT_AGE_RATIO` | employment years / age | career stability signal |
 | `INCOME_PER_FAMILY` | income / family size | real purchasing power per person |
 | `AGE_GROUP` | bins: 18–25, 26–35, 36–45, 46–55, 56–65, 65+ | captures non-linear age risk |
@@ -82,7 +98,7 @@ Implemented as `CreditRiskFeatureEngineer(BaseEstimator, TransformerMixin)` in `
 
 ## Feature Selection — Information Value (IV)
 
-Features are ranked by IV score before model training. IV quantifies how well a feature separates defaulters from non-defaulters.
+Features are ranked by IV score before model training. IV measures how well a feature separates defaulters from non-defaulters.
 
 | IV Range | Predictive Power |
 |----------|-----------------|
@@ -114,15 +130,76 @@ Implemented in `src/credit_risk/features/woe_encoder.py` as a sklearn-compatible
 
 ---
 
-## Model Results
+## Business Evaluation (Notebook 05)
 
-| Model | ROC-AUC | PR-AUC | CV-AUC Mean | CV-AUC Std |
-|-------|---------|--------|-------------|------------|
-| Logistic Regression (baseline) | 0.7458 | 0.2278 | 0.7438 | 0.0023 |
-| XGBoost | — | — | see notebook 03 | — |
-| LightGBM | — | — | see notebook 03 | — |
+Standard ML metrics are not enough for credit risk. Notebook 05 translates model performance into lender-relevant business metrics.
 
-> PR-AUC is low due to the 8% default rate — this is expected and normal in credit risk. ROC-AUC and KS statistic are the primary evaluation metrics in this domain.
+**KS Statistic — 37.9** (Acceptable range: 30–40). The model separates defaulters from non-defaulters with a 37.9pp gap at the optimal cut-off.
+
+**Decile Analysis** — top decile default rate: **27.1%** vs bottom decile: **1.4%** — a **19.2× separation ratio**. Clear monotonic decline confirms the scorecard is well-calibrated.
+
+**Profit Curve** — using lender economics (TN = +£500, FP = −£500, FN = −£2,000), the optimal threshold (0.81) yields **£18.6M expected profit** vs £7.5M at the standard 0.5 cut-off — a **£11.1M lift**.
+
+---
+
+## API
+
+Start the server:
+```bash
+uvicorn src.credit_risk.serving.app:app --reload
+```
+
+Interactive docs at `http://localhost:8000/docs`.
+
+### `GET /health`
+```json
+{
+  "status": "ok",
+  "model": "LightGBM + Optuna credit risk pipeline",
+  "test_roc_auc": 0.754
+}
+```
+
+### `POST /predict`
+
+**Request body (example — high-risk applicant):**
+```json
+{
+  "AMT_INCOME_TOTAL": 90000,
+  "AMT_CREDIT": 450000,
+  "AMT_ANNUITY": 22500,
+  "AMT_GOODS_PRICE": 400000,
+  "DAYS_BIRTH": -9000,
+  "DAYS_EMPLOYED": -180,
+  "CNT_FAM_MEMBERS": 1,
+  "NAME_EDUCATION_TYPE": "Secondary / secondary special",
+  "NAME_INCOME_TYPE": "Working",
+  "ORGANIZATION_TYPE": "Business Entity Type 3",
+  "EXT_SOURCE_1": 0.25,
+  "EXT_SOURCE_2": 0.30,
+  "EXT_SOURCE_3": 0.20
+}
+```
+
+**Response:**
+```json
+{
+  "default_probability": 0.3821,
+  "risk_grade": "D",
+  "decision": "Review",
+  "model_version": "lgb-optuna-auc0.754"
+}
+```
+
+**Risk grades:**
+
+| Grade | Probability | Decision |
+|-------|------------|----------|
+| A | < 5% | Approve |
+| B | 5–10% | Approve |
+| C | 10–20% | Review |
+| D | 20–35% | Review |
+| E | ≥ 35% | Decline |
 
 ---
 
@@ -152,14 +229,19 @@ notebooks/05_business_evaluation.ipynb
 pytest tests/ -v
 ```
 
+**5. Start the API**
+```bash
+uvicorn src.credit_risk.serving.app:app --reload
+```
+
 ---
 
 ## Key EDA Findings
 
 - `DAYS_EMPLOYED` contains an anomalous value (365,243) for unemployed applicants — clipped in `EMPLOYMENT_YEARS`
-- Missing data concentrated in external source scores (`EXT_SOURCE_1/2/3`) and document flags
+- Missing data is concentrated in external source scores (`EXT_SOURCE_1/2/3`) and document flags
 - Higher `DTI_RATIO` and `CREDIT_INCOME_RATIO` correlate with higher default rates
-- Younger applicants (18–25) show higher default rates than 36–45 age group
+- Younger applicants (18–25) show higher default rates than the 36–45 age group
 - `ORGANIZATION_TYPE` and `OCCUPATION_TYPE` are the strongest categorical predictors
 
 ---
@@ -169,8 +251,10 @@ pytest tests/ -v
 - **No data leakage:** `CreditRiskFeatureEngineer` uses only rule-based transformations — no statistics learned from training data
 - **WoE encoding:** fit on training data only, applied to test via sklearn `Pipeline`
 - **CV strategy:** `StratifiedKFold(n_splits=5)` preserves the 8% default rate across all folds
-- **Imbalanced classes:** handled with `class_weight='balanced'` (Logistic Regression, LightGBM) and `scale_pos_weight` (XGBoost)
+- **Imbalanced classes:** handled with `class_weight='balanced'` (LR) and `scale_pos_weight` (XGBoost, LightGBM)
+- **Optuna:** 50 TPE trials maximising 5-fold CV ROC-AUC, with `MedianPruner` to stop weak trials early
 - **Explainability:** SHAP `TreeExplainer` for global feature importance and per-applicant decision explanations
+- **Business threshold:** chosen by maximising expected profit, not F1 or accuracy
 
 ---
 
